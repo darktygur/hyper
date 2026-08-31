@@ -634,7 +634,9 @@ where
             Ok(encoder) => {
                 debug_assert!(self.state.cached_headers.is_none());
                 debug_assert!(head.headers.is_empty());
-                self.state.cached_headers = Some(head.headers);
+                if encoder.is_some() {
+                    self.state.cached_headers = Some(head.headers);
+                }
 
                 #[cfg(feature = "client")]
                 {

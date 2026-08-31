@@ -27,7 +27,7 @@
 //! The extensions in this module can be grouped as follows:
 //!
 //! - **HTTP/1 Reason Phrase**: [`ReasonPhrase`] — Access non-canonical reason phrases in HTTP/1 responses.
-//! - **Informational Responses**: [`on_informational`] — Register callbacks for 1xx HTTP/1 responses on the client.
+//! - **Informational Responses**: [`on_informational`] — Register per-request callbacks for 1xx responses on HTTP/1 or HTTP/2 clients.
 //! - **Header Case Tracking**: Internal types for tracking the original casing and order of headers as received.
 //! - **HTTP/2 Protocol Extensions**: [`Protocol`] — Access the `:protocol` pseudo-header for Extended CONNECT in HTTP/2.
 //!
@@ -54,11 +54,11 @@ mod h1_reason_phrase;
 #[cfg(any(feature = "http1", feature = "ffi"))]
 pub use h1_reason_phrase::ReasonPhrase;
 
-#[cfg(all(feature = "http1", feature = "client"))]
+#[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
 mod informational;
-#[cfg(all(feature = "http1", feature = "client"))]
+#[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
 pub use informational::on_informational;
-#[cfg(all(feature = "http1", feature = "client"))]
+#[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
 pub(crate) use informational::OnInformational;
 #[cfg(all(feature = "http1", feature = "client", feature = "ffi"))]
 pub(crate) use informational::{on_informational_raw, OnInformationalCallback};
@@ -304,14 +304,16 @@ impl OriginalHeaderOrder {
 /// server to send informational responses immediately (i.e. without delaying
 /// them until it has constructed a final, non-informational response).
 ///
-/// **Note:** This type should not be constructed directly by users.
-/// Use the `early_hints_pusher()` function to obtain a pusher
-/// that will lazily create this extension when needed.
+/// **Note:** This type should not be constructed directly by users. Clone it
+/// from an inbound request's extensions when informational responses need to
+/// be emitted outside the request handler's immediate scope.
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 #[derive(Clone, Debug)]
-pub struct InformationalSender(pub(crate) futures_channel::mpsc::Sender<http::Response<()>>);
+pub struct InformationalSender(
+    pub(crate) futures_channel::mpsc::UnboundedSender<http::Response<()>>,
+);
 
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 mod informational_sender;
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
-pub use informational_sender::{early_hints_pusher, EarlyHintsError, EarlyHintsPusher};
+pub use informational_sender::InformationalError;

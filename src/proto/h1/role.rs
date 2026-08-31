@@ -389,7 +389,8 @@ impl Http1Transaction for Server {
 
         let mut wrote_len = false;
 
-        let informational = msg.head.subject.is_informational();
+        let interim = msg.head.subject.is_informational()
+            && msg.head.subject != StatusCode::SWITCHING_PROTOCOLS;
 
         let is_last = if msg.head.subject == StatusCode::SWITCHING_PROTOCOLS {
             true
@@ -398,7 +399,7 @@ impl Http1Transaction for Server {
             // to CONNECT is forbidden in RFC 7231.
             wrote_len = true;
             true
-        } else if informational {
+        } else if interim {
             false
         } else {
             !msg.keep_alive
@@ -477,7 +478,7 @@ impl Http1Transaction for Server {
         // so we'll return `None` here.  Additionally, that will tell
         // `Conn::write_head` to stay in the `Writing::Init` state since we
         // haven't yet sent the final response.
-        Ok(if informational { None } else { Some(encoder) })
+        Ok(if interim { None } else { Some(encoder) })
     }
 
     fn on_error(err: &crate::Error) -> Option<MessageHead<Self::Outgoing>> {

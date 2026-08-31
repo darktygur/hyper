@@ -11,7 +11,7 @@ use h2::{Reason, RecvStream};
 use http::{Method, Request};
 use pin_project_lite::pin_project;
 
-use futures_channel::mpsc::Receiver;
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::stream::StreamExt;
 use http::Response;
 
@@ -59,7 +59,6 @@ pub(crate) struct Config {
     pub(crate) header_table_size: Option<u32>,
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
-    pub(crate) enable_informational: bool,
 }
 
 impl Default for Config {
@@ -79,7 +78,6 @@ impl Default for Config {
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
-            enable_informational: false,
         }
     }
 }
@@ -95,7 +93,6 @@ pin_project! {
         service: S,
         state: State<T, B>,
         date_header: bool,
-        enable_informational: bool,
         close_pending: bool
     }
 }
@@ -184,7 +181,6 @@ where
             },
             service,
             date_header: config.date_header,
-            enable_informational: config.enable_informational,
             close_pending: false,
         }
     }
@@ -241,12 +237,7 @@ where
                     if me.close_pending && srv.closing.is_none() {
                         srv.conn.graceful_shutdown();
                     }
-                    ready!(srv.poll_server(
-                        cx,
-                        &mut me.service,
-                        &mut me.exec,
-                        me.enable_informational
-                    ))?;
+                    ready!(srv.poll_server(cx, &mut me.service, &mut me.exec))?;
                     return Poll::Ready(Ok(Dispatched::Shutdown));
                 }
             };
@@ -265,7 +256,6 @@ where
         cx: &mut Context<'_>,
         service: &mut S,
         exec: &mut E,
-        enable_informational: bool,
     ) -> Poll<crate::Result<()>>
     where
         S: HttpService<IncomingBody, ResBody = B>,
@@ -322,20 +312,9 @@ where
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
 
-                        // Conditionally create channel infrastructure for early hints
-                        // Only when explicitly enabled via builder
-                        let informational_rx = if enable_informational {
-                            const CHANNEL_CAPACITY: usize = 10;
-                            let (tx, rx) = futures_channel::mpsc::channel(CHANNEL_CAPACITY);
-
-                            // Insert sender for early_hints_pusher() to find
-                            req.extensions_mut()
-                                .insert(crate::ext::InformationalSender(tx));
-
-                            Some(rx)
-                        } else {
-                            None
-                        };
+                        let (tx, informational_rx) = futures_channel::mpsc::unbounded();
+                        req.extensions_mut()
+                            .insert(crate::ext::InformationalSender(tx));
 
                         let fut = H2Stream::new(
                             service.call(req),
@@ -343,7 +322,7 @@ where
                             respond,
                             self.date_header,
                             exec.clone(),
-                            informational_rx,
+                            Some(informational_rx),
                         );
 
                         exec.execute_h2stream(fut);
@@ -402,7 +381,7 @@ pin_project! {
         state: H2StreamState<F, B>,
         date_header: bool,
         exec: E,
-        informational_rx: Option<Receiver<Response<()>>>,
+        informational_rx: Option<UnboundedReceiver<Response<()>>>,
     }
 }
 
@@ -440,7 +419,7 @@ where
         respond: SendResponse<SendBuf<B::Data>>,
         date_header: bool,
         exec: E,
-        informational_rx: Option<Receiver<Response<()>>>,
+        informational_rx: Option<UnboundedReceiver<Response<()>>>,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
@@ -477,7 +456,7 @@ where
     /// Poll and send any pending informational responses.
     /// Returns Poll::Ready(Err) if sending fails, Poll::Pending otherwise.
     fn poll_informational(
-        informational_rx: &mut Option<Receiver<Response<()>>>,
+        informational_rx: &mut Option<UnboundedReceiver<Response<()>>>,
         reply: &mut SendResponse<SendBuf<B::Data>>,
         cx: &mut Context<'_>,
     ) -> Poll<crate::Result<()>> {
@@ -669,51 +648,5 @@ mod tests {
             DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE
         );
         assert!(config.date_header);
-
-        // Most importantly, informational should be disabled by default
-        assert!(!config.enable_informational);
-    }
-
-    #[test]
-    fn test_config_enable_informational_flag() {
-        let mut config = Config::default();
-        assert!(!config.enable_informational);
-
-        config.enable_informational = true;
-        assert!(config.enable_informational);
-    }
-
-    #[test]
-    fn test_config_preserves_other_values_when_setting_informational() {
-        let mut config = Config::default();
-        config.max_concurrent_streams = Some(100);
-        config.max_frame_size = 32768;
-
-        config.enable_informational = true;
-
-        assert!(config.enable_informational);
-        assert_eq!(config.max_concurrent_streams, Some(100));
-        assert_eq!(config.max_frame_size, 32768);
-    }
-
-    #[test]
-    fn test_config_can_be_cloned() {
-        let mut config = Config::default();
-        config.enable_informational = true;
-        config.max_concurrent_streams = Some(50);
-
-        let cloned = config.clone();
-
-        assert_eq!(cloned.enable_informational, config.enable_informational);
-        assert_eq!(cloned.max_concurrent_streams, config.max_concurrent_streams);
-    }
-
-    #[test]
-    fn test_config_debug_format() {
-        let config = Config::default();
-        let debug_output = format!("{:?}", config);
-
-        // Verify debug output contains the field
-        assert!(debug_output.contains("enable_informational"));
     }
 }

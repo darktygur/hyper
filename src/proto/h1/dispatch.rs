@@ -9,7 +9,7 @@ use std::{
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 #[cfg(feature = "server")]
-use futures_channel::mpsc::{self, Receiver};
+use futures_channel::mpsc::{self, UnboundedReceiver};
 use futures_core::ready;
 #[cfg(feature = "server")]
 use futures_util::stream::StreamExt;
@@ -54,8 +54,9 @@ cfg_server! {
     use crate::service::HttpService;
 
     pub(crate) struct Server<S: HttpService<B>, B> {
-        informational_rx: Option<Receiver<Response<()>>>,
+        informational_rx: Option<UnboundedReceiver<Response<()>>>,
         in_flight: Pin<Box<Option<S::Future>>>,
+        final_response: Option<Response<S::ResBody>>,
         pub(crate) service: S,
     }
 }
@@ -578,6 +579,7 @@ cfg_server! {
             Server {
                 informational_rx: None,
                 in_flight: Box::pin(None),
+                final_response: None,
                 service,
             }
         }
@@ -607,11 +609,15 @@ cfg_server! {
         ) -> Poll<Option<Result<(Self::PollItem, Option<Self::PollBody>), Self::PollError>>> {
             let mut this = self.as_mut();
 
-            if let Some(informational_rx) = this.informational_rx.as_mut() {
-                if let Poll::Ready(informational) = informational_rx.poll_next_unpin(cx) {
-                    if let Some(informational) = informational {
-                        let (parts, _) = informational.into_parts();
-                        if parts.status.is_informational() {
+            loop {
+                if let Some(informational_rx) = this.informational_rx.as_mut() {
+                    if let Poll::Ready(informational) = informational_rx.poll_next_unpin(cx) {
+                        if let Some(informational) = informational {
+                            let (parts, _) = informational.into_parts();
+                            debug_assert!(
+                                parts.status.is_informational()
+                                    && parts.status != http::StatusCode::SWITCHING_PROTOCOLS
+                            );
                             let head = MessageHead {
                                 version: parts.version,
                                 subject: parts.status,
@@ -620,35 +626,32 @@ cfg_server! {
                             };
                             return Poll::Ready(Some(Ok((head, None))));
                         } else {
-                            // TODO: We should return an error here, but we have
-                            // no way of creating a `Self::PollError`; might
-                            // need to change the signature of
-                            // `Dispatch::poll_msg`.
+                            this.informational_rx = None;
                         }
-                    } else {
-                        this.informational_rx = None;
                     }
                 }
+
+                if let Some(resp) = this.final_response.take() {
+                    let (parts, body) = resp.into_parts();
+                    let head = MessageHead {
+                        version: parts.version,
+                        subject: parts.status,
+                        headers: parts.headers,
+                        extensions: parts.extensions,
+                    };
+                    this.informational_rx = None;
+                    return Poll::Ready(Some(Ok((head, Some(body)))));
+                }
+
+                if let Some(ref mut fut) = this.in_flight.as_mut().as_pin_mut() {
+                    let resp = ready!(fut.as_mut().poll(cx)?);
+                    this.in_flight.set(None);
+                    this.final_response = Some(resp);
+                    continue;
+                }
+
+                unreachable!("poll_msg shouldn't be called without a response");
             }
-
-            let ret = if let Some(ref mut fut) = this.in_flight.as_mut().as_pin_mut() {
-                let resp = ready!(fut.as_mut().poll(cx)?);
-                let (parts, body) = resp.into_parts();
-                let head = MessageHead {
-                    version: parts.version,
-                    subject: parts.status,
-                    headers: parts.headers,
-                    extensions: parts.extensions,
-                };
-                Poll::Ready(Some(Ok((head, Some(body)))))
-            } else {
-                unreachable!("poll_msg shouldn't be called if no inflight");
-            };
-
-            // Since in_flight finished, remove it
-            this.in_flight.set(None);
-            this.informational_rx = None;
-            ret
         }
 
         fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, IncomingBody)>) -> crate::Result<()> {
@@ -659,16 +662,17 @@ cfg_server! {
             *req.headers_mut() = msg.headers;
             *req.version_mut() = msg.version;
             *req.extensions_mut() = msg.extensions;
-            let (informational_tx, informational_rx) = mpsc::channel(1);
+            let (informational_tx, informational_rx) = mpsc::unbounded();
             assert!(req.extensions_mut().insert(InformationalSender(informational_tx)).is_none());
             let fut = self.service.call(req);
             self.informational_rx = Some(informational_rx);
+            self.final_response = None;
             self.in_flight.set(Some(fut));
             Ok(())
         }
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
-            if self.in_flight.is_some() {
+            if self.in_flight.is_some() || self.final_response.is_some() {
                 Poll::Pending
             } else {
                 Poll::Ready(Ok(()))
@@ -676,7 +680,7 @@ cfg_server! {
         }
 
         fn should_poll(&self) -> bool {
-            self.in_flight.is_some()
+            self.in_flight.is_some() || self.final_response.is_some()
         }
     }
 }

@@ -153,7 +153,6 @@ pub(crate) async fn handshake<T, B, E>(
     config: &Config,
     mut exec: E,
     timer: Time,
-    informational_config: Option<crate::client::conn::informational::InformationalConfig>,
 ) -> crate::Result<ClientTask<B, E, T>>
 where
     T: Read + Write + Unpin,
@@ -202,7 +201,6 @@ where
         h2_tx,
         req_rx,
         fut_ctx: None,
-        informational_callback: informational_config.and_then(|config| config.callback),
         marker: PhantomData,
     })
 }
@@ -420,7 +418,7 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<IncomingBody>>,
-    informational_callback: Option<crate::client::conn::informational::InformationalCallback>,
+    informational_callback: Option<crate::ext::OnInformational>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -437,7 +435,6 @@ where
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
     fut_ctx: Option<FutCtx<B>>,
-    informational_callback: Option<crate::client::conn::informational::InformationalCallback>,
     marker: PhantomData<T>,
 }
 
@@ -596,7 +593,7 @@ pin_project! {
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
         exec: E,
         cancel_tx: Option<oneshot::Sender<()>>,
-        informational_callback: Option<crate::client::conn::informational::InformationalCallback>,
+        informational_callback: Option<crate::ext::OnInformational>,
     }
 }
 
@@ -626,7 +623,7 @@ where
                 match this.fut.poll_informational(cx) {
                     Poll::Ready(Some(Ok(informational_response))) => {
                         // Invoke the callback with the informational response
-                        callback(informational_response);
+                        callback.call(informational_response);
                         processed_informational = true;
                         // Continue polling for more informational responses
                         continue;
@@ -745,10 +742,9 @@ where
                     }
                     let (head, body) = req.into_parts();
 
-                    // Use the connection-level informational callback
-                    let informational_callback = self.informational_callback.clone();
-
                     let mut req = ::http::Request::from_parts(head, ());
+                    let informational_callback =
+                        req.extensions_mut().remove::<crate::ext::OnInformational>();
                     super::strip_connection_headers(req.headers_mut(), super::MessageKind::Request);
                     if let Some(len) = body.size_hint().exact() {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
