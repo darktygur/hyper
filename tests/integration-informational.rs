@@ -138,7 +138,11 @@ async fn http1_informational_responses_are_forwarded_before_the_final_response()
     request
         .headers_mut()
         .insert("host", "localhost".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("connection", "close".parse().unwrap());
     hyper::ext::on_informational(&mut request, move |response| {
+        assert!(response.headers().get("connection").is_none());
         capture
             .lock()
             .unwrap()

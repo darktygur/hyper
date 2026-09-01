@@ -392,6 +392,13 @@ impl Http1Transaction for Server {
         let interim = msg.head.subject.is_informational()
             && msg.head.subject != StatusCode::SWITCHING_PROTOCOLS;
 
+        // Connection persistence applies to the final response. In particular,
+        // `Connection: close` on an interim response tells clients to reject the
+        // final response as data received after the connection was closed.
+        if interim {
+            msg.head.headers.remove(header::CONNECTION);
+        }
+
         let is_last = if msg.head.subject == StatusCode::SWITCHING_PROTOCOLS {
             true
         } else if msg.req_method == &Some(Method::CONNECT) && msg.head.subject.is_success() {
